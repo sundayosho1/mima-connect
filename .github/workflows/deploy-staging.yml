@@ -1,0 +1,110 @@
+name: Deploy to Staging (mimaconnect.canmpef.com)
+
+on:
+  push:
+    branches: [ develop, main ]
+  pull_request:
+    branches: [ develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.2'
+        extensions: mbstring, xml, ctype, json, openssl, pdo_mysql, zip, gd, curl, fileinfo
+        coverage: none
+    
+    - name: Copy .env
+      run: |
+        cp .env.ci .env
+        php artisan key:generate
+    
+    - name: Install Dependencies
+      run: composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist
+    
+    - name: Run Migrations (SQLite for testing)
+      run: |
+        touch database/database.sqlite
+        php artisan migrate --force
+    
+    - name: Run Tests
+      run: php artisan test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.2'
+        extensions: mbstring, xml, ctype, json, openssl, pdo_mysql, zip, gd, curl, fileinfo
+    
+    - name: Install Dependencies (Production)
+      run: composer install --no-dev --optimize-autoloader --no-interaction
+    
+    - name: Setup Environment File
+      run: |
+        cp .env.example .env
+        # Production values will be replaced on server
+    
+    - name: Deploy to cPanel (SCP)
+      uses: appleboy/scp-action@master
+      with:
+        host: ${{ secrets.CPANEL_HOST }}
+        username: ${{ secrets.CPANEL_USER }}
+        password: ${{ secrets.CPANEL_PASSWORD }}
+        port: ${{ secrets.CPANEL_PORT || '22' }}
+        source: ".,!vendor,!node_modules,!tests,!database/database.sqlite"
+        target: "/home2/canmpefc/public_html/mimaconnect.canmpef.com"
+        strip_components: 0
+        overwrite: true
+        rm: false
+    
+    - name: Execute Post-Deploy Commands
+      uses: appleboy/ssh-action@master
+      with:
+        host: ${{ secrets.CPANEL_HOST }}
+        username: ${{ secrets.CPANEL_USER }}
+        password: ${{ secrets.CPANEL_PASSWORD }}
+        port: ${{ secrets.CPANEL_PORT || '22' }}
+        script: |
+          cd /home2/canmpefc/public_html/mimaconnect.canmpef.com
+          
+          # Set correct permissions
+          chmod -R 755 .
+          chmod -R 775 storage
+          chmod -R 775 bootstrap/cache
+          
+          # Install production dependencies (in case vendor excluded)
+          # composer install --no-dev --optimize-autoloader --no-interaction
+          
+          # Run migrations
+          php artisan migrate --force --seed
+          
+          # Clear and cache configs
+          php artisan config:clear
+          php artisan config:cache
+          php artisan route:cache
+          php artisan view:cache
+          
+          # Clear old cache
+          php artisan cache:clear
+          
+          # Create storage link if not exists
+          php artisan storage:link || true
+          
+          # Optimize
+          php artisan optimize
+          
+          echo "Deployment completed at $(date)"
